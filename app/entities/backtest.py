@@ -46,6 +46,11 @@ class BacktestResult(Base):
     # 元数据
     status = Column(String(20), default="pending")  # pending, running, completed, failed
     error_message = Column(Text, nullable=True)
+    # 血缘与版本：本次回测消费的数据批次、分析版本与缺口窗口
+    data_batch_ids_json = Column(Text, nullable=True)
+    analysis_version_id = Column(Integer, nullable=True, index=True)
+    data_gaps_json = Column(Text, nullable=True)
+    superseded_by_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
     

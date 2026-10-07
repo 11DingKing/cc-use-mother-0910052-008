@@ -43,6 +43,15 @@ async def get_report(result_id: int):
     return backtest_service.get_result(result_id)
 
 
+@router.post("/{result_id}/rerun")
+async def rerun_backtest(
+    result_id: int,
+    reason: Optional[str] = Query(default=None, description="重跑原因，如补数批次号"),
+):
+    """补数后按新版本数据重跑；旧回测记录保留并指向新记录。"""
+    return backtest_service.rerun_backtest(result_id, reason=reason)
+
+
 @router.get("/list")
 async def list_results(
     stock_code: Optional[str] = Query(default=None, description="股票代码"),

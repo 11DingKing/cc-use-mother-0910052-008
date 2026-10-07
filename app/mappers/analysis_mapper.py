@@ -40,8 +40,44 @@ class AnalysisMapper:
             and_(
                 AnalysisResult.stock_code == stock_code,
                 AnalysisResult.period == period,
+                AnalysisResult.is_current == 1,
             )
-        ).order_by(AnalysisResult.updated_at.desc()).first()
+        ).order_by(AnalysisResult.version.desc()).first()
+
+    def get_version(
+        self,
+        stock_code: str,
+        period: str,
+        version: int,
+    ) -> Optional[AnalysisResult]:
+        """业务模块说明。"""
+        return self.session.query(AnalysisResult).filter(
+            and_(
+                AnalysisResult.stock_code == stock_code,
+                AnalysisResult.period == period,
+                AnalysisResult.version == version,
+            )
+        ).first()
+
+    def list_versions(
+        self,
+        stock_code: str,
+        period: str,
+        include_superseded: bool = True,
+        limit: Optional[int] = None,
+    ) -> List[AnalysisResult]:
+        """业务模块说明。"""
+        query = self.session.query(AnalysisResult).filter(
+            and_(
+                AnalysisResult.stock_code == stock_code,
+                AnalysisResult.period == period,
+            )
+        ).order_by(AnalysisResult.version.desc())
+        if not include_superseded:
+            query = query.filter(AnalysisResult.is_current == 1)
+        if limit:
+            query = query.limit(limit)
+        return query.all()
     
     def get_by_stock_period(
         self,
@@ -55,12 +91,18 @@ class AnalysisMapper:
                 AnalysisResult.stock_code == stock_code,
                 AnalysisResult.period == period,
             )
-        ).order_by(AnalysisResult.updated_at.desc())
-        
+        ).order_by(AnalysisResult.version.desc())
+
         if limit:
             query = query.limit(limit)
-        
+
         return query.all()
+
+    def publish(self, result: AnalysisResult) -> AnalysisResult:
+        """把某个分析版本标记为已发布报告（不可变，不被覆盖）。"""
+        result.is_published = 1
+        self.session.flush()
+        return result
     
     def update(self, result: AnalysisResult) -> AnalysisResult:
         """业务模块说明。"""
@@ -99,68 +141,67 @@ class AnalysisMapper:
         duans: List[Duan],
         zhongshus: List[Zhongshu],
         signals: List[Signal],
+        data_batch_ids: Optional[List[int]] = None,
+        data_gaps: Optional[List[Dict[str, Any]]] = None,
+        latest_data_batch_id: Optional[int] = None,
+        recompute_reason: Optional[str] = None,
     ) -> AnalysisResult:
-        """业务模块说明。"""
+        """保存分析结果：永远产生新版本，旧版本（含已发布报告）保持不变。"""
         # 序列化各组件
         fractals_json = json.dumps([self.serializer.serialize(f) for f in fractals])
         bis_json = json.dumps([self.serializer.serialize(b) for b in bis])
         duans_json = json.dumps([self.serializer.serialize(d) for d in duans])
         zhongshus_json = json.dumps([self.serializer.serialize(z) for z in zhongshus])
         signals_json = json.dumps([self.serializer.serialize(s) for s in signals])
-        
+
         # 获取最新信号
         latest_signal = signals[-1] if signals else None
-        
-        # 查找现有记录
-        existing = self.get_latest(stock_code, period)
-        
-        if existing:
-            # 更新现有记录
-            existing.start_time = start_time
-            existing.end_time = end_time
-            existing.fractals_json = fractals_json
-            existing.bis_json = bis_json
-            existing.duans_json = duans_json
-            existing.zhongshus_json = zhongshus_json
-            existing.signals_json = signals_json
-            existing.fractal_count = len(fractals)
-            existing.bi_count = len(bis)
-            existing.duan_count = len(duans)
-            existing.zhongshu_count = len(zhongshus)
-            existing.signal_count = len(signals)
-            
-            if latest_signal:
-                existing.latest_signal_type = latest_signal.signal_type.value
-                existing.latest_signal_time = latest_signal.timestamp
-                existing.latest_signal_price = latest_signal.price
-            
+
+        previous = self.get_latest(stock_code, period)
+        next_version = (previous.version + 1) if previous else 1
+
+        result = AnalysisResult(
+            stock_code=stock_code,
+            period=period,
+            version=next_version,
+            is_current=1,
+            is_published=0,
+            recompute_reason=recompute_reason,
+            data_batch_ids_json=(
+                json.dumps(data_batch_ids) if data_batch_ids is not None else None
+            ),
+            data_gaps_json=(
+                json.dumps(data_gaps) if data_gaps is not None else None
+            ),
+            latest_data_batch_id=latest_data_batch_id,
+            start_time=start_time,
+            end_time=end_time,
+            fractals_json=fractals_json,
+            bis_json=bis_json,
+            duans_json=duans_json,
+            zhongshus_json=zhongshus_json,
+            signals_json=signals_json,
+            fractal_count=len(fractals),
+            bi_count=len(bis),
+            duan_count=len(duans),
+            zhongshu_count=len(zhongshus),
+            signal_count=len(signals),
+        )
+
+        if latest_signal:
+            result.latest_signal_type = latest_signal.signal_type.value
+            result.latest_signal_time = latest_signal.timestamp
+            result.latest_signal_price = latest_signal.price
+
+        self.session.add(result)
+        self.session.flush()
+
+        if previous is not None:
+            previous.is_current = 0
+            previous.superseded_by_id = result.id
             self.session.flush()
-            return existing
-        else:
-            # 创建新记录
-            result = AnalysisResult(
-                stock_code=stock_code,
-                period=period,
-                start_time=start_time,
-                end_time=end_time,
-                fractals_json=fractals_json,
-                bis_json=bis_json,
-                duans_json=duans_json,
-                zhongshus_json=zhongshus_json,
-                signals_json=signals_json,
-                fractal_count=len(fractals),
-                bi_count=len(bis),
-                duan_count=len(duans),
-                zhongshu_count=len(zhongshus),
-                signal_count=len(signals),
-            )
-            
-            if latest_signal:
-                result.latest_signal_type = latest_signal.signal_type.value
-                result.latest_signal_time = latest_signal.timestamp
-                result.latest_signal_price = latest_signal.price
-            
-            return self.create(result)
+
+        return result
     
     def load_fractals(self, result: AnalysisResult) -> List[Fractal]:
         """业务模块说明。"""
@@ -214,7 +255,8 @@ class AnalysisMapper:
     ) -> List[AnalysisResult]:
         """业务模块说明。"""
         query = self.session.query(AnalysisResult).filter(
-            AnalysisResult.latest_signal_type.isnot(None)
+            AnalysisResult.latest_signal_type.isnot(None),
+            AnalysisResult.is_current == 1,
         )
         
         if signal_type:

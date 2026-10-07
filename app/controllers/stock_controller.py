@@ -35,6 +35,8 @@ async def get_candles(
                 "low": c.low,
                 "close": c.close,
                 "volume": c.volume,
+                "source": getattr(c, "source", None),
+                "source_batch_id": getattr(c, "source_batch_id", None),
             }
             for c in candles
         ],

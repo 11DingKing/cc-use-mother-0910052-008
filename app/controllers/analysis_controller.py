@@ -14,9 +14,32 @@ analysis_service = AnalysisService()
 async def get_analysis(
     code: str,
     period: str = Query(default="daily", description="K线周期"),
+    version: Optional[int] = Query(default=None, description="分析版本号，缺省取当前版本"),
 ):
     """业务模块说明。"""
-    return analysis_service.get_result(code, period)
+    return analysis_service.get_result(code, period, version=version)
+
+
+@router.get("/{code}/versions")
+async def list_analysis_versions(
+    code: str,
+    period: str = Query(default="daily", description="K线周期"),
+    limit: int = Query(default=20, le=100),
+):
+    """列出分析版本与陈旧状态（已发布版本不会被删除或覆盖）。"""
+    return {
+        "versions": analysis_service.list_versions(code, period, limit=limit),
+    }
+
+
+@router.post("/{code}/publish")
+async def publish_analysis(
+    code: str,
+    period: str = Query(default="daily"),
+    version: int = Query(..., description="要发布为报告的版本号"),
+):
+    """发布指定分析版本；发布后冻结，补数重算只会产生新版本。"""
+    return analysis_service.publish_version(code, period, version)
 
 
 @router.post("/{code}/run")

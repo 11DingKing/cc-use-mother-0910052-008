@@ -1,8 +1,11 @@
 """业务模块说明。"""
 
+import json
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import logging
+
+from sqlalchemy import func
 
 from app.config import db_session_scope
 from app.mappers.analysis_mapper import AnalysisMapper
@@ -33,6 +36,8 @@ class AnalysisService:
         self.duan_detector = DuanDetector()
         self.zhongshu_detector = ZhongshuDetector()
         self.multi_level_linkage = MultiLevelLinkage()
+        from app.services.lineage_service import LineageService
+        self.lineage_service = LineageService()
     
     def run_analysis(
         self,
@@ -40,52 +45,63 @@ class AnalysisService:
         period: str,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
+        recompute_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         """业务模块说明。"""
         stock_code = validate_stock_code(stock_code)
         period = validate_period(period)
         start_date, end_date = validate_time_range(start_date, end_date)
-        
+
         try:
             # 获取K线数据
             candles = self.stock_service.get_candles(
                 stock_code, period, start_date, end_date
             )
-            
+
             if not candles:
                 raise AnalysisException(
                     message="No candle data available",
                     stock_code=stock_code,
                     period=period,
                 )
-            
+
+            # 数据血缘：本窗口使用了哪些批次、覆盖了哪些缺口
+            lineage = self._collect_lineage(
+                stock_code, period, start_date, end_date, candles
+            )
+
             # 清洗和合并K线
             cleaned, _ = self.kline_processor.clean(candles)
             merged = self.kline_processor.merge(cleaned)
-            
+
             # 识别分型
             fractals = self.fractal_detector.detect(merged)
-            
+
             # 识别笔
             bis = self.bi_detector.detect(fractals, merged)
-            
+
             # 识别段
             duans = self.duan_detector.detect(bis)
-            
+
             # 识别中枢
             zhongshus = self.zhongshu_detector.detect(bis)
-            
+
             # 识别买卖点
             signal_detector = SignalDetector(stock_code, period)
             signals = signal_detector.detect_all(bis, duans, zhongshus)
-            
-            # 保存结果
-            self._save_result(
+
+            # 保存结果（新版本，旧版本含已发布报告不受影响）
+            saved = self._save_result(
                 stock_code, period, start_date, end_date,
-                fractals, bis, duans, zhongshus, signals
+                fractals, bis, duans, zhongshus, signals,
+                lineage=lineage, recompute_reason=recompute_reason,
             )
-            
+
             return {
+                "id": (saved or {}).get("id"),
+                "version": (saved or {}).get("version"),
+                "is_published": (saved or {}).get("is_published", False),
+                "recompute_reason": (saved or {}).get("recompute_reason"),
                 "stock_code": stock_code,
                 "period": period,
                 "candle_count": len(candles),
@@ -96,8 +112,12 @@ class AnalysisService:
                 "zhongshu_count": len(zhongshus),
                 "signal_count": len(signals),
                 "latest_signal": signals[-1].signal_type.value if signals else None,
+                "data_lineage": lineage,
+                "affected_by_open_gaps": any(
+                    g["status"] in ("open", "partial") for g in lineage["gaps"]
+                ),
             }
-            
+
         except AnalysisException:
             raise
         except Exception as e:
@@ -107,7 +127,36 @@ class AnalysisService:
                 stock_code=stock_code,
                 period=period,
             )
-    
+
+    def _collect_lineage(
+        self,
+        stock_code: str,
+        period: str,
+        start_date: datetime,
+        end_date: datetime,
+        candles: List,
+    ) -> Dict[str, Any]:
+        """汇总本次分析数据窗口的批次血缘与缺口状态。"""
+        batch_ids = sorted({
+            getattr(c, "source_batch_id", None)
+            for c in candles
+            if getattr(c, "source_batch_id", None) is not None
+        })
+        try:
+            from app.services.lineage_service import LineageService
+            window = LineageService().data_lineage_for_window(
+                stock_code, period, start_date, end_date
+            )
+            # 以实际读到的 K 线批次为准，窗口查询补充缺口信息
+            window["batch_ids"] = sorted(set(batch_ids) | set(window["batch_ids"]))
+            window["latest_batch_id"] = (
+                max(window["batch_ids"]) if window["batch_ids"] else None
+            )
+            return window
+        except Exception as e:
+            logger.warning(f"Lineage lookup error: {e}")
+            return {"batch_ids": batch_ids, "latest_batch_id": max(batch_ids) if batch_ids else None, "gaps": []}
+
     def _save_result(
         self,
         stock_code: str,
@@ -119,41 +168,71 @@ class AnalysisService:
         duans: List[Duan],
         zhongshus: List[Zhongshu],
         signals: List[Signal],
-    ) -> None:
+        lineage: Optional[Dict[str, Any]] = None,
+        recompute_reason: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """业务模块说明。"""
         try:
             with db_session_scope() as session:
                 mapper = AnalysisMapper(session)
-                mapper.save_analysis(
+                saved = mapper.save_analysis(
                     stock_code, period, start_date, end_date,
-                    fractals, bis, duans, zhongshus, signals
+                    fractals, bis, duans, zhongshus, signals,
+                    data_batch_ids=(lineage or {}).get("batch_ids"),
+                    data_gaps=(lineage or {}).get("gaps"),
+                    latest_data_batch_id=(lineage or {}).get("latest_batch_id"),
+                    recompute_reason=recompute_reason,
                 )
+                # 在会话关闭前提取，避免 DetachedInstanceError
+                return {
+                    "id": saved.id,
+                    "version": saved.version,
+                    "is_published": bool(saved.is_published),
+                    "recompute_reason": saved.recompute_reason,
+                }
         except Exception as e:
             logger.warning(f"Save result error: {e}")
+            return None
     
     def get_result(
         self,
         stock_code: str,
         period: str,
+        version: Optional[int] = None,
     ) -> Dict[str, Any]:
         """业务模块说明。"""
         stock_code = validate_stock_code(stock_code)
         period = validate_period(period)
-        
+
         with db_session_scope() as session:
             mapper = AnalysisMapper(session)
-            result = mapper.get_latest(stock_code, period)
-            
+            result = (
+                mapper.get_version(stock_code, period, version)
+                if version is not None else mapper.get_latest(stock_code, period)
+            )
+
             if not result:
                 raise NotFoundException(
                     message="Analysis result not found",
                     resource_type="AnalysisResult",
-                    resource_id=f"{stock_code}:{period}",
+                    resource_id=f"{stock_code}:{period}"
+                    + (f":v{version}" if version is not None else ""),
                 )
-            
+
             return {
+                "id": result.id,
                 "stock_code": result.stock_code,
                 "period": result.period,
+                "version": result.version,
+                "is_current": bool(result.is_current),
+                "is_published": bool(result.is_published),
+                "superseded_by_id": result.superseded_by_id,
+                "recompute_reason": result.recompute_reason,
+                "data_batch_ids": json.loads(result.data_batch_ids_json)
+                if result.data_batch_ids_json else [],
+                "data_gaps": json.loads(result.data_gaps_json)
+                if result.data_gaps_json else [],
+                "is_stale": self._is_stale(session, result),
                 "start_time": result.start_time.isoformat(),
                 "end_time": result.end_time.isoformat(),
                 "fractal_count": result.fractal_count,
@@ -165,6 +244,64 @@ class AnalysisService:
                 "latest_signal_time": result.latest_signal_time.isoformat() if result.latest_signal_time else None,
                 "latest_signal_price": result.latest_signal_price,
                 "updated_at": result.updated_at.isoformat(),
+            }
+
+    @staticmethod
+    def _is_stale(session, result) -> bool:
+        """结果消费的最新数据批次落后于该标的/周期的最新批次即为陈旧。"""
+        from app.entities.lineage import IngestionBatch
+        newest = session.query(func.max(IngestionBatch.id)).filter(
+            IngestionBatch.stock_code == result.stock_code,
+            IngestionBatch.period == result.period,
+        ).scalar()
+        if newest is None:
+            return False
+        return result.latest_data_batch_id is None or result.latest_data_batch_id < newest
+
+    def list_versions(self, stock_code: str, period: str, limit: int = 20):
+        """列出分析版本（含已发布报告，历史版本不被删除）。"""
+        stock_code = validate_stock_code(stock_code)
+        period = validate_period(period)
+        with db_session_scope() as session:
+            mapper = AnalysisMapper(session)
+            rows = mapper.list_versions(stock_code, period, limit=limit)
+            return [
+                {
+                    "id": r.id,
+                    "version": r.version,
+                    "is_current": bool(r.is_current),
+                    "is_published": bool(r.is_published),
+                    "recompute_reason": r.recompute_reason,
+                    "latest_data_batch_id": r.latest_data_batch_id,
+                    "is_stale": self._is_stale(session, r),
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+
+    def publish_version(
+        self,
+        stock_code: str,
+        period: str,
+        version: int,
+    ) -> Dict[str, Any]:
+        """发布某个分析版本为报告；发布后该版本冻结，重算只产生新版本。"""
+        stock_code = validate_stock_code(stock_code)
+        period = validate_period(period)
+        with db_session_scope() as session:
+            mapper = AnalysisMapper(session)
+            result = mapper.get_version(stock_code, period, version)
+            if not result:
+                raise NotFoundException(
+                    message="Analysis version not found",
+                    resource_type="AnalysisResult",
+                    resource_id=f"{stock_code}:{period}:v{version}",
+                )
+            mapper.publish(result)
+            return {
+                "id": result.id,
+                "version": result.version,
+                "is_published": True,
             }
     
     def get_signals(

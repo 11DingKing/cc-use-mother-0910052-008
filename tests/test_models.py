@@ -67,7 +67,15 @@ class TestRawCandle:
         assert c1 == c2
 
     def test_field_count(self):
-        assert len(fields(RawCandle)) == 6
+        # 6 个行情字段 + 3 个来源血缘字段（均带默认值，向后兼容）
+        assert len(fields(RawCandle)) == 9
+
+    def test_lineage_fields_default_none(self):
+        ts = datetime(2024, 1, 1)
+        candle = RawCandle(timestamp=ts, open=10.0, high=12.0, low=9.0, close=11.0, volume=1000.0)
+        assert candle.source is None
+        assert candle.source_batch_id is None
+        assert candle.current_version_id is None
 
 
 # ── MergedCandle Tests ──────────────────────────────────────────────────────

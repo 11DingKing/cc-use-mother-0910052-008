@@ -1,7 +1,7 @@
 """业务模块说明。"""
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Index
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Index, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
@@ -14,7 +14,20 @@ class AnalysisResult(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     stock_code = Column(String(20), nullable=False, index=True)
     period = Column(String(10), nullable=False, index=True)  # daily, 60min, 30min
-    
+
+    # 版本化：同一 (stock_code, period) 每次计算产生新版本
+    version = Column(Integer, nullable=False, default=1)
+    is_current = Column(Integer, nullable=False, default=1, index=True)
+    is_published = Column(Integer, nullable=False, default=0, index=True)
+    superseded_by_id = Column(Integer, nullable=True)
+    recompute_reason = Column(String(64), nullable=True)
+    # 触发本次计算的数据批次集合（JSON: [batch_id, ...]）
+    data_batch_ids_json = Column(Text, nullable=True)
+    # 数据覆盖窗口的缺口状态（JSON: [{"range_start","range_end","status"}, ...]）
+    data_gaps_json = Column(Text, nullable=True)
+    # 参与计算的最新数据批次 id，用于判断是否已经过期
+    latest_data_batch_id = Column(Integer, nullable=True, index=True)
+
     # 分析时间范围
     start_time = Column(DateTime, nullable=False)
     end_time = Column(DateTime, nullable=False)
@@ -44,8 +57,12 @@ class AnalysisResult(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     __table_args__ = (
+        UniqueConstraint(
+            'stock_code', 'period', 'version', name='uix_analysis_version'
+        ),
         Index('ix_analysis_stock_period', 'stock_code', 'period'),
         Index('ix_analysis_latest_signal', 'stock_code', 'latest_signal_type'),
+        Index('ix_analysis_current', 'stock_code', 'period', 'is_current'),
     )
     
     def __repr__(self):
@@ -56,10 +73,25 @@ class AnalysisResult(Base):
     
     def to_dict(self) -> dict:
         """业务模块说明。"""
+        import json
+
         return {
             "id": self.id,
             "stock_code": self.stock_code,
             "period": self.period,
+            "version": self.version,
+            "is_current": bool(self.is_current),
+            "is_published": bool(self.is_published),
+            "superseded_by_id": self.superseded_by_id,
+            "recompute_reason": self.recompute_reason,
+            "data_batch_ids": (
+                json.loads(self.data_batch_ids_json)
+                if self.data_batch_ids_json else []
+            ),
+            "data_gaps": (
+                json.loads(self.data_gaps_json) if self.data_gaps_json else []
+            ),
+            "latest_data_batch_id": self.latest_data_batch_id,
             "start_time": self.start_time.isoformat() if self.start_time else None,
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "fractal_count": self.fractal_count,

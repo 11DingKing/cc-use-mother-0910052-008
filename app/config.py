@@ -71,14 +71,94 @@ def init_database():
     from app.entities.analysis_result import Base as AnalysisBase
     from app.entities.watchlist import Base as WatchlistBase
     from app.entities.backtest import Base as BacktestBase
-    
+    from app.entities.lineage import Base as LineageBase
+
     engine = get_engine()
-    
+
     # 创建所有表
     StockBase.metadata.create_all(bind=engine)
     AnalysisBase.metadata.create_all(bind=engine)
     WatchlistBase.metadata.create_all(bind=engine)
     BacktestBase.metadata.create_all(bind=engine)
+    LineageBase.metadata.create_all(bind=engine)
+
+    _apply_lightweight_migrations(engine)
+
+
+def _apply_lightweight_migrations(engine) -> None:
+    """为已存在的 SQLite 库补齐新版本字段（新库无需执行）。"""
+    if "sqlite" not in DATABASE_URL:
+        return
+
+    from sqlalchemy import text
+
+    additions = {
+        "stock_candles": [
+            ("source", "VARCHAR(32)"),
+            ("source_batch_id", "INTEGER"),
+            ("current_version_id", "INTEGER"),
+        ],
+        "analysis_results": [
+            ("version", "INTEGER NOT NULL DEFAULT 1"),
+            ("is_current", "INTEGER NOT NULL DEFAULT 1"),
+            ("is_published", "INTEGER NOT NULL DEFAULT 0"),
+            ("superseded_by_id", "INTEGER"),
+            ("recompute_reason", "VARCHAR(64)"),
+            ("data_batch_ids_json", "TEXT"),
+            ("data_gaps_json", "TEXT"),
+            ("latest_data_batch_id", "INTEGER"),
+        ],
+        "backtest_results": [
+            ("data_batch_ids_json", "TEXT"),
+            ("analysis_version_id", "INTEGER"),
+            ("data_gaps_json", "TEXT"),
+            ("superseded_by_id", "INTEGER"),
+        ],
+    }
+
+    with engine.begin() as conn:
+        for table, columns in additions.items():
+            existing = {
+                row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))
+            }
+            if not existing:
+                continue  # 表刚由 create_all 建立，字段已齐全
+            for name, ddl in columns:
+                if name not in existing:
+                    conn.execute(text(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
+                    ))
+        # 旧分析记录补唯一版本号
+        conn.execute(text(
+            "UPDATE analysis_results SET version = COALESCE("
+            "(SELECT COUNT(*) FROM analysis_results a2 "
+            "WHERE a2.stock_code = analysis_results.stock_code "
+            "AND a2.period = analysis_results.period "
+            "AND a2.id <= analysis_results.id), 1) "
+            "WHERE version IS NULL OR version = 0"
+        ))
+
+        # 为已存在的表补建新增索引（create_all 不会改已有表）
+        new_indexes = [
+            "CREATE INDEX IF NOT EXISTS ix_stock_candles_source_batch "
+            "ON stock_candles (source_batch_id)",
+            "CREATE INDEX IF NOT EXISTS ix_stock_candles_current_version "
+            "ON stock_candles (current_version_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uix_analysis_version "
+            "ON analysis_results (stock_code, period, version)",
+            "CREATE INDEX IF NOT EXISTS ix_analysis_results_current "
+            "ON analysis_results (stock_code, period, is_current)",
+            "CREATE INDEX IF NOT EXISTS ix_analysis_results_published "
+            "ON analysis_results (is_published)",
+            "CREATE INDEX IF NOT EXISTS ix_analysis_results_latest_data_batch "
+            "ON analysis_results (latest_data_batch_id)",
+            "CREATE INDEX IF NOT EXISTS ix_backtest_results_analysis_version "
+            "ON backtest_results (analysis_version_id)",
+            "CREATE INDEX IF NOT EXISTS ix_backtest_results_superseded "
+            "ON backtest_results (superseded_by_id)",
+        ]
+        for ddl in new_indexes:
+            conn.execute(text(ddl))
 
 # 数据源配置
 DATA_SOURCE_CONFIG = {

@@ -37,6 +37,10 @@ class RawCandle:
     low: float
     close: float
     volume: float
+    # 来源血缘（可选，从数据库读取时由缓存层填充）
+    source: Optional[str] = None
+    source_batch_id: Optional[int] = None
+    current_version_id: Optional[int] = None
 
 
 @dataclass

@@ -143,10 +143,13 @@ class StockMapper:
                 low=c.low,
                 close=c.close,
                 volume=c.volume,
+                source=c.source,
+                source_batch_id=c.source_batch_id,
+                current_version_id=c.current_version_id,
             )
             for c in candles
         ]
-    
+
     def from_raw_candles(
         self,
         candles: List[RawCandle],
@@ -164,6 +167,9 @@ class StockMapper:
                 low=c.low,
                 close=c.close,
                 volume=c.volume,
+                source=getattr(c, "source", None),
+                source_batch_id=getattr(c, "source_batch_id", None),
+                current_version_id=getattr(c, "current_version_id", None),
             )
             for c in candles
         ]

@@ -26,7 +26,12 @@ class StockCandle(Base):
     is_limit_up = Column(Integer, default=0)    # 涨停标记
     is_limit_down = Column(Integer, default=0)  # 跌停标记
     is_suspended = Column(Integer, default=0)   # 停牌标记
-    
+
+    # 来源血缘：当前取值由哪个批次/来源写入，对应哪个版本
+    source = Column(String(32), nullable=True)
+    source_batch_id = Column(Integer, nullable=True, index=True)
+    current_version_id = Column(Integer, nullable=True, index=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -59,4 +64,7 @@ class StockCandle(Base):
             "is_limit_up": bool(self.is_limit_up),
             "is_limit_down": bool(self.is_limit_down),
             "is_suspended": bool(self.is_suspended),
+            "source": self.source,
+            "source_batch_id": self.source_batch_id,
+            "current_version_id": self.current_version_id,
         }
