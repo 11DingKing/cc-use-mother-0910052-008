@@ -51,6 +51,29 @@ async def fetch_candles(
     """业务模块说明。"""
     start = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
     end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else None
-    
+
     result = stock_service.fetch_and_update(code, period, start, end)
     return result
+
+
+@router.get("/{code}/candles/lineage")
+async def get_candles_with_lineage(
+    code: str,
+    period: str = Query(default="daily", description="K线周期"),
+    start_date: Optional[str] = Query(default=None),
+    end_date: Optional[str] = Query(default=None),
+):
+    """读取K线并返回每根数据的来源批次、序列版本与区间内缺口。"""
+    start = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
+    end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else None
+    data = stock_service.get_candles_with_lineage(code, period, start, end)
+    # RawCandle 不能直接 JSON 序列化，转为字典
+    data["candles"] = [
+        {
+            "timestamp": c.timestamp.isoformat(),
+            "open": c.open, "high": c.high, "low": c.low,
+            "close": c.close, "volume": c.volume,
+        }
+        for c in data["candles"]
+    ]
+    return data

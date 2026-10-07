@@ -1,7 +1,7 @@
 """业务模块说明。"""
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Index
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, Index, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
@@ -46,12 +46,29 @@ class BacktestResult(Base):
     # 元数据
     status = Column(String(20), default="pending")  # pending, running, completed, failed
     error_message = Column(Text, nullable=True)
+
+    # ---- 版本化与血缘：同一配置重复回测追加版本，旧版本（含已发布）保留 ----
+    result_version = Column(Integer, default=1)
+    is_current = Column(Integer, default=1)
+    parent_result_id = Column(Integer, nullable=True)
+    # 回测消费的数据版本/批次/快照
+    data_version_no = Column(Integer, nullable=True)
+    based_on_batch_id = Column(String(32), nullable=True)
+    snapshot_name = Column(String(128), nullable=True)
+    affected_gap_ids_json = Column(Text, nullable=True)
+    # 该版本是否已发布（不可变）
+    report_status = Column(String(16), default="draft")
+    published_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
-    
+
     __table_args__ = (
         Index('ix_backtest_stock_period', 'stock_code', 'period'),
         Index('ix_backtest_status', 'status'),
+        # 版本号在“同一配置族”内递增（配置族由服务层按参数判定，用 parent 链串联）
+        Index('ix_backtest_current', 'stock_code', 'period', 'is_current'),
+        Index('ix_backtest_report_status', 'report_status'),
     )
     
     def __repr__(self):
@@ -81,6 +98,13 @@ class BacktestResult(Base):
             "losing_trades": self.losing_trades,
             "status": self.status,
             "error_message": self.error_message,
+            "result_version": self.result_version,
+            "is_current": bool(self.is_current),
+            "data_version_no": self.data_version_no,
+            "based_on_batch_id": self.based_on_batch_id,
+            "snapshot_name": self.snapshot_name,
+            "report_status": self.report_status,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }

@@ -39,12 +39,13 @@ from app.middleware.logging_middleware import register_logging_middleware
 register_logging_middleware(app)
 
 # 注册控制器路由
-from app.controllers import stock_router, analysis_router, watchlist_router, backtest_router, trading_router
+from app.controllers import stock_router, analysis_router, watchlist_router, backtest_router, trading_router, lineage_router
 app.include_router(stock_router)
 app.include_router(analysis_router)
 app.include_router(watchlist_router)
 app.include_router(backtest_router)
 app.include_router(trading_router)
+app.include_router(lineage_router)
 
 
 # 健康检查端点
@@ -65,6 +66,15 @@ async def startup_event():
         logger.info("数据库初始化完成")
     except Exception as e:
         logger.error(f"数据库初始化失败: {e}")
+
+    # 上次进程异常退出时残留的 running 批次标记为 interrupted
+    try:
+        from app.services.lineage_service import DataLineageService
+        interrupted = DataLineageService().reconcile_interrupted()
+        if interrupted:
+            logger.warning("发现 %d 个中断的导入批次: %s", len(interrupted), interrupted)
+    except Exception as e:
+        logger.error(f"中断批次对账失败: {e}")
     
     logger.info(f"API文档地址: http://{APP_CONFIG['host']}:{APP_CONFIG['port']}/docs")
 

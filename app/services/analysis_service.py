@@ -5,6 +5,7 @@ from typing import List, Optional, Dict, Any
 import logging
 
 from app.config import db_session_scope
+from app.entities.analysis_result import AnalysisResult
 from app.mappers.analysis_mapper import AnalysisMapper
 from app.services.stock_service import StockService
 from app.chan.kline_processor import KLineProcessor
@@ -17,16 +18,26 @@ from app.chan.multi_level import MultiLevelLinkage, CombinedSignal
 from app.chan.models import Fractal, Bi, Duan, Zhongshu, Signal
 from app.utils.validators import validate_stock_code, validate_time_range, validate_period
 from app.middleware.exception_handler import AnalysisException, NotFoundException
+from app.services.lineage_service import DataLineageService
 
 logger = logging.getLogger(__name__)
+
+
+# 补数后重算策略：
+# always         — 数据版本有变化就重算
+# on_gap_filled  — 仅当原结果区间内存在“曾受影响且现已补齐”的缺口时重算
+# on_open_gap    — 仅当区间内仍有未结缺口时才重算（保守，不建议自动）
+# manual         — 不自动重算，只登记待处理
+RECOMPUTE_POLICIES = ("always", "on_gap_filled", "on_open_gap", "manual")
 
 
 class AnalysisService:
     """业务模块说明。"""
     stock_service = StockService()
-    
+
     def __init__(self):
         self.stock_service = self.__class__.stock_service
+        self.lineage = DataLineageService()
         self.kline_processor = KLineProcessor()
         self.fractal_detector = FractalDetector()
         self.bi_detector = BiDetector()
@@ -34,6 +45,29 @@ class AnalysisService:
         self.zhongshu_detector = ZhongshuDetector()
         self.multi_level_linkage = MultiLevelLinkage()
     
+    def compute_signals(
+        self,
+        candles: List,
+        stock_code: str,
+        period: str,
+    ) -> Dict[str, Any]:
+        """对给定K线（可为历史快照）执行缠论计算，不落库。"""
+        cleaned, _ = self.kline_processor.clean(candles)
+        merged = self.kline_processor.merge(cleaned)
+        fractals = self.fractal_detector.detect(merged)
+        bis = self.bi_detector.detect(fractals, merged)
+        duans = self.duan_detector.detect(bis)
+        zhongshus = self.zhongshu_detector.detect(bis)
+        signal_detector = SignalDetector(stock_code, period)
+        signals = signal_detector.detect_all(bis, duans, zhongshus)
+        return {
+            "fractals": fractals,
+            "bis": bis,
+            "duans": duans,
+            "zhongshus": zhongshus,
+            "signals": signals,
+        }
+
     def run_analysis(
         self,
         stock_code: str,
@@ -79,12 +113,23 @@ class AnalysisService:
             signal_detector = SignalDetector(stock_code, period)
             signals = signal_detector.detect_all(bis, duans, zhongshus)
             
-            # 保存结果
+            # 保存结果（携带数据版本、批次与缺口影响范围）
+            data_info = self.lineage.get_current_data_version_info(
+                stock_code, period
+            )
+            affected_gaps = self.lineage.get_gaps_affecting_range(
+                stock_code, period, start_date, end_date
+            )
+            affected_gap_ids = [g["id"] for g in affected_gaps]
+
             self._save_result(
                 stock_code, period, start_date, end_date,
-                fractals, bis, duans, zhongshus, signals
+                fractals, bis, duans, zhongshus, signals,
+                data_version_no=data_info.get("version_no") if data_info else None,
+                based_on_batch_id=data_info.get("import_batch_id") if data_info else None,
+                affected_gap_ids=affected_gap_ids,
             )
-            
+
             return {
                 "stock_code": stock_code,
                 "period": period,
@@ -96,6 +141,12 @@ class AnalysisService:
                 "zhongshu_count": len(zhongshus),
                 "signal_count": len(signals),
                 "latest_signal": signals[-1].signal_type.value if signals else None,
+                "data_version_no": data_info.get("version_no") if data_info else None,
+                "affected_open_gaps": [
+                    {"id": g["id"], "gap_start": g["gap_start"], "gap_end": g["gap_end"],
+                     "status": g["status"]}
+                    for g in affected_gaps if g["affected"]
+                ],
             }
             
         except AnalysisException:
@@ -119,17 +170,25 @@ class AnalysisService:
         duans: List[Duan],
         zhongshus: List[Zhongshu],
         signals: List[Signal],
-    ) -> None:
+        data_version_no: Optional[int] = None,
+        based_on_batch_id: Optional[str] = None,
+        affected_gap_ids: Optional[List[int]] = None,
+    ) -> int:
         """业务模块说明。"""
         try:
             with db_session_scope() as session:
                 mapper = AnalysisMapper(session)
-                mapper.save_analysis(
+                result = mapper.save_analysis(
                     stock_code, period, start_date, end_date,
-                    fractals, bis, duans, zhongshus, signals
+                    fractals, bis, duans, zhongshus, signals,
+                    data_version_no=data_version_no,
+                    based_on_batch_id=based_on_batch_id,
+                    affected_gap_ids=affected_gap_ids,
                 )
+                return result.id
         except Exception as e:
             logger.warning(f"Save result error: {e}")
+            return 0
     
     def get_result(
         self,
@@ -139,33 +198,19 @@ class AnalysisService:
         """业务模块说明。"""
         stock_code = validate_stock_code(stock_code)
         period = validate_period(period)
-        
+
         with db_session_scope() as session:
             mapper = AnalysisMapper(session)
             result = mapper.get_latest(stock_code, period)
-            
+
             if not result:
                 raise NotFoundException(
                     message="Analysis result not found",
                     resource_type="AnalysisResult",
                     resource_id=f"{stock_code}:{period}",
                 )
-            
-            return {
-                "stock_code": result.stock_code,
-                "period": result.period,
-                "start_time": result.start_time.isoformat(),
-                "end_time": result.end_time.isoformat(),
-                "fractal_count": result.fractal_count,
-                "bi_count": result.bi_count,
-                "duan_count": result.duan_count,
-                "zhongshu_count": result.zhongshu_count,
-                "signal_count": result.signal_count,
-                "latest_signal_type": result.latest_signal_type,
-                "latest_signal_time": result.latest_signal_time.isoformat() if result.latest_signal_time else None,
-                "latest_signal_price": result.latest_signal_price,
-                "updated_at": result.updated_at.isoformat(),
-            }
+
+            return self._result_summary(result)
     
     def get_signals(
         self,
@@ -408,5 +453,216 @@ class AnalysisService:
         if latest.strength >= 0.7:
             signal_type = "买入" if latest.signal_type.value.startswith("buy") else "卖出"
             return f"【正常】{primary_period}级别{signal_type}信号，多周期共振，信号强度: {latest.strength:.2f}"
-        
+
         return f"信号强度较弱 ({latest.strength:.2f})，建议观望或轻仓"
+
+    # ------------------------------------------------------------------
+    # 版本化结果：历史版本读取 / 发布 / 影响面 / 补数后重算
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _result_summary(result) -> Dict[str, Any]:
+        import json as _json
+        gap_ids = []
+        if result.affected_gap_ids_json:
+            try:
+                gap_ids = _json.loads(result.affected_gap_ids_json)
+            except ValueError:
+                gap_ids = []
+        return {
+            "id": result.id,
+            "stock_code": result.stock_code,
+            "period": result.period,
+            "result_version": result.result_version,
+            "is_current": bool(result.is_current),
+            "status": result.status,
+            "published_at": result.published_at.isoformat() if result.published_at else None,
+            "snapshot_name": result.snapshot_name,
+            "start_time": result.start_time.isoformat(),
+            "end_time": result.end_time.isoformat(),
+            "fractal_count": result.fractal_count,
+            "bi_count": result.bi_count,
+            "duan_count": result.duan_count,
+            "zhongshu_count": result.zhongshu_count,
+            "signal_count": result.signal_count,
+            "latest_signal_type": result.latest_signal_type,
+            "latest_signal_time": result.latest_signal_time.isoformat() if result.latest_signal_time else None,
+            "latest_signal_price": result.latest_signal_price,
+            "data_version_no": result.data_version_no,
+            "based_on_batch_id": result.based_on_batch_id,
+            "affected_gap_ids": gap_ids,
+            "updated_at": result.updated_at.isoformat(),
+        }
+
+    def get_result_version(
+        self, stock_code: str, period: str, result_version: int
+    ) -> Dict[str, Any]:
+        """按版本号读取历史结果；已发布报告永远可读，不受补数影响。"""
+        stock_code = validate_stock_code(stock_code)
+        period = validate_period(period)
+        with db_session_scope() as session:
+            result = AnalysisMapper(session).get_version(
+                stock_code, period, result_version
+            )
+            if not result:
+                raise NotFoundException(
+                    message="Analysis result version not found",
+                    resource_type="AnalysisResult",
+                    resource_id=f"{stock_code}:{period}:v{result_version}",
+                )
+            return self._result_summary(result)
+
+    def list_result_versions(
+        self, stock_code: str, period: str, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        stock_code = validate_stock_code(stock_code)
+        period = validate_period(period)
+        with db_session_scope() as session:
+            rows = AnalysisMapper(session).list_versions(stock_code, period, limit=limit)
+            return [self._result_summary(r) for r in rows]
+
+    def publish_report(
+        self, stock_code: str, period: str, result_version: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """发布报告：按其依据的批次时点固化数据快照，报告行变为不可变。"""
+        stock_code = validate_stock_code(stock_code)
+        period = validate_period(period)
+        with db_session_scope() as session:
+            mapper = AnalysisMapper(session)
+            result = (
+                mapper.get_version(stock_code, period, result_version)
+                if result_version is not None
+                else mapper.get_latest(stock_code, period)
+            )
+            if not result:
+                raise NotFoundException(
+                    message="Analysis result not found",
+                    resource_type="AnalysisResult",
+                    resource_id=f"{stock_code}:{period}",
+                )
+            if result.status == "published":
+                return self._result_summary(result)
+
+            snapshot_name = f"rpt-analysis-{result.id}-v{result.result_version}"
+            from app.mappers.lineage_mapper import LineageMapper
+            lineage_mapper = LineageMapper(mapper.session)
+            if result.based_on_batch_id:
+                snap = lineage_mapper.create_snapshot_as_of_batch(
+                    stock_code, period, snapshot_name,
+                    as_of_batch_id=result.based_on_batch_id,
+                    data_version_no=result.data_version_no,
+                    note=f"published analysis result {result.id}",
+                )
+            else:
+                snap = lineage_mapper.create_snapshot(
+                    stock_code, period, snapshot_name,
+                    note=f"published analysis result {result.id}",
+                )
+            mapper.publish(result, snap.name)
+            return self._result_summary(result)
+
+    def find_results_affected_by_gap(self, gap_id: int) -> List[Dict[str, Any]]:
+        """哪些分析结果把该缺口计入过影响范围（含已发布报告）。"""
+        import json as _json
+        with db_session_scope() as session:
+            all_rows = session.query(AnalysisResult).all()
+            matched = []
+            for row in all_rows:
+                ids = []
+                if row.affected_gap_ids_json:
+                    try:
+                        ids = _json.loads(row.affected_gap_ids_json)
+                    except ValueError:
+                        ids = []
+                if gap_id in ids:
+                    matched.append(self._result_summary(row))
+            return matched
+
+    def recompute_after_backfill(
+        self,
+        stock_code: str,
+        period: str,
+        policy: str = "on_gap_filled",
+    ) -> Dict[str, Any]:
+        """补数后按明确策略决定是否重算。已发布报告不被覆盖，只产生新版本。
+
+        - always: 数据版本领先于结果依据版本即重算
+        - on_gap_filled: 原结果标注的缺口中，已有在其后被补齐的才重算
+        - on_open_gap: 区间仍有未结缺口时重算
+        - manual: 只返回判断结果，不执行重算
+        """
+        if policy not in RECOMPUTE_POLICIES:
+            raise ValueError(f"policy must be one of {RECOMPUTE_POLICIES}")
+
+        stock_code = validate_stock_code(stock_code)
+        period = validate_period(period)
+
+        with db_session_scope() as session:
+            mapper = AnalysisMapper(session)
+            latest = mapper.get_latest(stock_code, period)
+            if latest is None:
+                return {"recomputed": False, "reason": "no_existing_result"}
+            from app.mappers.lineage_mapper import LineageMapper
+            lm = LineageMapper(session)
+            current_dv = lm.get_current_data_version(stock_code, period)
+            current_version_no = current_dv.version_no if current_dv else None
+            based_on = latest.data_version_no
+            affected_ids = []
+            if latest.affected_gap_ids_json:
+                import json as _json
+                try:
+                    affected_ids = _json.loads(latest.affected_gap_ids_json)
+                except ValueError:
+                    affected_ids = []
+            start_time, end_time = latest.start_time, latest.end_time
+
+            data_advanced = (
+                current_version_no is not None
+                and based_on is not None
+                and current_version_no > based_on
+            )
+
+            if not data_advanced:
+                should, reason = False, "up_to_date"
+            elif policy == "always":
+                should, reason = True, "data_version_advanced"
+            elif policy == "manual":
+                should, reason = False, "data_version_advanced_manual_policy"
+            elif policy == "on_gap_filled":
+                filled_after = [
+                    gid for gid in affected_ids
+                    if (gap := lm.get_gap(gid)) and gap.status in ("filled", "verified")
+                ]
+                should = bool(filled_after)
+                reason = "affected_gap_filled" if should else "no_affected_gap_filled"
+            else:  # on_open_gap
+                open_gaps = [
+                    g for g in self.lineage.get_gaps_affecting_range(
+                        stock_code, period, start_time, end_time
+                    ) if g["affected"]
+                ]
+                should = bool(open_gaps)
+                reason = "open_gap_in_range" if should else "no_open_gap"
+
+            latest_version = latest.result_version
+
+        if policy == "manual":
+            return {
+                "recomputed": False,
+                "should_recompute": data_advanced,
+                "reason": reason,
+                "policy": policy,
+            }
+
+        if not should:
+            return {"recomputed": False, "reason": reason, "policy": policy,
+                    "current_result_version": latest_version}
+
+        new_summary = self.run_analysis(stock_code, period, start_time, end_time)
+        return {
+            "recomputed": True,
+            "reason": reason,
+            "policy": policy,
+            "previous_result_version": latest_version,
+            "new_result": new_summary,
+        }

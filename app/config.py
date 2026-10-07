@@ -71,14 +71,98 @@ def init_database():
     from app.entities.analysis_result import Base as AnalysisBase
     from app.entities.watchlist import Base as WatchlistBase
     from app.entities.backtest import Base as BacktestBase
-    
+    from app.entities.lineage import Base as LineageBase
+
     engine = get_engine()
-    
+
     # 创建所有表
     StockBase.metadata.create_all(bind=engine)
     AnalysisBase.metadata.create_all(bind=engine)
     WatchlistBase.metadata.create_all(bind=engine)
     BacktestBase.metadata.create_all(bind=engine)
+    LineageBase.metadata.create_all(bind=engine)
+
+    # 对既有 SQLite/其他库补齐新增列（开发期轻量迁移，等价于列级 ADD COLUMN）
+    _ensure_columns(engine)
+
+
+def _ensure_columns(engine):
+    """为旧库补加新版本引入的列；新库的 create_all 已包含，跳过即可。"""
+    from sqlalchemy import text, inspect
+
+    required = {
+        "stock_candles": [
+            ("current_version_id", "INTEGER"),
+            ("current_version_no", "INTEGER DEFAULT 1"),
+            ("current_source", "VARCHAR(32)"),
+            ("last_batch_id", "VARCHAR(32)"),
+        ],
+        "analysis_results": [
+            ("result_version", "INTEGER DEFAULT 1"),
+            ("is_current", "INTEGER DEFAULT 1"),
+            ("parent_result_id", "INTEGER"),
+            ("superseded_by_id", "INTEGER"),
+            ("superseded_at", "DATETIME"),
+            ("status", "VARCHAR(16) DEFAULT 'draft'"),
+            ("published_at", "DATETIME"),
+            ("data_version_no", "INTEGER"),
+            ("based_on_batch_id", "VARCHAR(32)"),
+            ("affected_gap_ids_json", "TEXT"),
+            ("snapshot_name", "VARCHAR(128)"),
+            ("recompute_policy", "VARCHAR(32)"),
+        ],
+        "backtest_results": [
+            ("result_version", "INTEGER DEFAULT 1"),
+            ("is_current", "INTEGER DEFAULT 1"),
+            ("parent_result_id", "INTEGER"),
+            ("data_version_no", "INTEGER"),
+            ("based_on_batch_id", "VARCHAR(32)"),
+            ("snapshot_name", "VARCHAR(128)"),
+            ("affected_gap_ids_json", "TEXT"),
+            ("report_status", "VARCHAR(16) DEFAULT 'draft'"),
+            ("published_at", "DATETIME"),
+        ],
+    }
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        for table, columns in required.items():
+            if table not in existing_tables:
+                continue
+            present = {col["name"] for col in inspector.get_columns(table)}
+            for name, ddl in columns:
+                if name not in present:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+        # 旧库已有的K线没有行版本：补建 source=legacy 的 v1 并回填指针，
+        # 使历史数据同样可追溯、可进入快照
+        if "stock_candles" in existing_tables:
+            conn.execute(text(
+                """
+                INSERT INTO candle_data_versions
+                  (candle_id, version_no, stock_code, period, timestamp,
+                   open, high, low, close, volume, amount,
+                   import_batch_id, source, ingest_order, status, change_reason, created_at)
+                SELECT s.id, 1, s.stock_code, s.period, s.timestamp,
+                       s.open, s.high, s.low, s.close, COALESCE(s.volume, 0), s.amount,
+                       NULL, 'legacy', 0, 'active', 'normal', CURRENT_TIMESTAMP
+                FROM stock_candles s
+                WHERE s.current_version_id IS NULL
+                """
+            ))
+            conn.execute(text(
+                """
+                UPDATE stock_candles SET
+                  current_version_id = (
+                    SELECT cdv.id FROM candle_data_versions cdv
+                    WHERE cdv.candle_id = stock_candles.id AND cdv.version_no = 1
+                  ),
+                  current_source = COALESCE(current_source, 'legacy'),
+                  current_version_no = COALESCE(current_version_no, 1)
+                WHERE current_version_id IS NULL
+                """
+            ))
 
 # 数据源配置
 DATA_SOURCE_CONFIG = {

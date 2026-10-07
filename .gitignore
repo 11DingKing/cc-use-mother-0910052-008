@@ -10,3 +10,6 @@ coverage/
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# 运行时 SQLite 数据库
+*.db

@@ -92,11 +92,11 @@ async def get_multi_level_recommendation(
     sec_periods: List[str] = []
     if secondary_periods:
         sec_periods = [p.strip() for p in secondary_periods.split(",") if p.strip()]
-    
+
     result = analysis_service.run_multi_level_analysis(
         code, primary_period, sec_periods or None
     )
-    
+
     return {
         "stock_code": code,
         "primary_period": primary_period,
@@ -105,3 +105,52 @@ async def get_multi_level_recommendation(
         "strong_confirmations": result["summary"]["strong_confirmations"],
         "conflicts": result["summary"]["conflicts"],
     }
+
+
+# ---------------------------------------------------------------------------
+# 结果版本化、发布与补数后重算
+# ---------------------------------------------------------------------------
+
+@router.get("/{code}/versions")
+async def list_versions(
+    code: str,
+    period: str = Query(default="daily"),
+    limit: int = Query(default=50),
+):
+    """列出分析结果的全部版本（草稿与已发布）。"""
+    return {
+        "versions": analysis_service.list_result_versions(code, period, limit)
+    }
+
+
+@router.get("/{code}/versions/{result_version}")
+async def get_version(
+    code: str,
+    result_version: int,
+    period: str = Query(default="daily"),
+):
+    """按版本号读取历史结果；已发布报告不随补数变化。"""
+    return analysis_service.get_result_version(code, period, result_version)
+
+
+@router.post("/{code}/publish")
+async def publish_report(
+    code: str,
+    period: str = Query(default="daily"),
+    result_version: Optional[int] = Query(default=None, description="不指定则发布当前版本"),
+):
+    """发布报告：固化当时数据快照并锁定结果版本为不可变。"""
+    return analysis_service.publish_report(code, period, result_version)
+
+
+@router.post("/{code}/recompute")
+async def recompute_after_backfill(
+    code: str,
+    period: str = Query(default="daily"),
+    policy: str = Query(
+        default="on_gap_filled",
+        description="重算策略: always / on_gap_filled / on_open_gap / manual",
+    ),
+):
+    """补数完成后按明确策略判断并重算；已发布版本保留，重算只产生新版本。"""
+    return analysis_service.recompute_after_backfill(code, period, policy)

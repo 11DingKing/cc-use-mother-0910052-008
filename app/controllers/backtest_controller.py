@@ -19,6 +19,7 @@ class RunBacktestRequest(BaseModel):
     end_date: Optional[str] = None
     initial_capital: float = 100000.0
     position_size: float = 1.0
+    snapshot_name: Optional[str] = None  # 指定后按不可变历史快照复现回测
 
 
 @router.post("/run")
@@ -26,7 +27,7 @@ async def run_backtest(request: RunBacktestRequest):
     """业务模块说明。"""
     start = datetime.strptime(request.start_date, "%Y-%m-%d") if request.start_date else None
     end = datetime.strptime(request.end_date, "%Y-%m-%d") if request.end_date else None
-    
+
     return backtest_service.run_backtest(
         request.stock_code,
         request.period,
@@ -34,7 +35,20 @@ async def run_backtest(request: RunBacktestRequest):
         end,
         request.initial_capital,
         request.position_size,
+        snapshot_name=request.snapshot_name,
     )
+
+
+@router.post("/{result_id}/publish")
+async def publish_backtest_report(result_id: int):
+    """发布回测报告：固化数据快照并锁定版本。"""
+    return backtest_service.publish_report(result_id)
+
+
+@router.get("/affected-by-gap/{gap_id}")
+async def affected_by_gap(gap_id: int):
+    """查询受某缺口影响的全部回测版本（含已发布）。"""
+    return {"results": backtest_service.find_results_affected_by_gap(gap_id)}
 
 
 @router.get("/{result_id}/report")
